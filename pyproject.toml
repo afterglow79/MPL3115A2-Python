@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mpl3115a2-driver"
+version = "0.1.0"
+description = "SMBus Python driver for MPL3115A2 and MPL3115A2ST1 pressure/altitude sensors"
+readme = "README.md"
+requires-python = ">=3.9"
+
+[project.optional-dependencies]
+i2c = ["smbus2>=0.4"]
+test = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+include = ["mpl3115a2*"]
+
+[tool.setuptools.package-data]
+mpl3115a2 = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

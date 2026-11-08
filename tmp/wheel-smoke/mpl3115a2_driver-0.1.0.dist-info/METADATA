@@ -1,0 +1,174 @@
+Metadata-Version: 2.4
+Name: mpl3115a2-driver
+Version: 0.1.0
+Summary: SMBus Python driver for MPL3115A2 and MPL3115A2ST1 pressure/altitude sensors
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Provides-Extra: i2c
+Requires-Dist: smbus2>=0.4; extra == "i2c"
+Provides-Extra: test
+Requires-Dist: pytest>=7; extra == "test"
+
+# MPL3115A2 Python driver
+
+A Python 3.9+ I2C library for the MPL3115A2, including the MPL3115A2ST1
+ordering variant. Reads absolute pressure (Pa), die temperature (Celsius),
+and hardware-computed altitude (meters).
+
+## Install on Raspberry Pi
+
+Enable I2C using `sudo raspi-config` (Interface Options -> I2C), then install
+from this project directory in your application's virtual environment:
+
+```sh
+python -m pip install ".[i2c]"
+```
+
+This installs the library and `smbus2`. If you already use the original
+`smbus` package, `python -m pip install .` is sufficient. The driver prefers
+`smbus2`, falls back to `smbus`, and can borrow either type of bus object.
+This project has not been published to PyPI; install from this folder or
+the supplied wheel. Access to `/dev/i2c-1` is required (normally via the
+`i2c` group). Windows can run the tests, but Raspberry Pi's native Linux
+I2C bus is required for the default backend.
+
+For a direct 3.3 V Raspberry Pi connection: SDA is GPIO2 (physical pin 3),
+SCL is GPIO3 (pin 5), with a common ground. Use 3.3 V logic/pull-ups.
+For a bare sensor, follow the datasheet's VDD, VDDIO, CAP and decoupling
+circuit requirements. A breakout board may already contain these parts;
+check your board's schematic. The fixed sensor address is `0x60`, using
+7-bit addressing (not the shifted wire values `0xC0`/`0xC1`).
+
+## Quick start
+
+```python
+from mpl3115a2 import MPL3115A2
+
+with MPL3115A2(bus_number=1) as sensor:
+    reading = sensor.read()
+    print(f"Pressure: {reading.pressure_pa:.2f} Pa")
+    print(f"Temperature: {reading.temperature_c:.2f} C")
+    print(f"Altitude: {sensor.read_altitude():.2f} m")
+```
+
+To reuse the bus from your snippet:
+
+```python
+import smbus
+from mpl3115a2 import MPL3115A2
+
+bus = smbus.SMBus(1)
+try:
+    with MPL3115A2(bus=bus) as sensor:
+        print(sensor.read_pressure())
+finally:
+    bus.close()  # You own this bus; the driver does not close borrowed buses.
+```
+
+Run `python examples/read_sensor.py` after installation for a continuous
+pressure/temperature display. Press Ctrl+C to stop.
+
+## API
+
+`MPL3115A2(bus_number=1, *, bus=None, address=0x60, oversampling=128, timeout=2.0)`
+
+- `bus`: optional object implementing `read_byte_data`, `write_byte_data`,
+  and `read_i2c_block_data` with the usual SMBus signatures. Its lifetime
+  stays with the caller. Internally opened buses also implement `close`.
+- `oversampling`: ratio of 1, 2, 4, 8, 16, 32, 64, or 128, set at creation.
+  Higher values reduce noise but increase conversion time. At 128x the
+  datasheet lists 512 ms minimum between samples; default timeout is 2 s.
+- `timeout`: positive, finite seconds per sensor wait. A read following
+  a timeout can also wait for the earlier conversion before starting its
+  own. OS-level I2C calls have their own timeout and can block separately.
+- `address`: defaults to the chip's fixed address; only change this when
+  your system explicitly remaps addresses (for example through a bridge).
+
+| Operation | Result |
+| --- | --- |
+| `read()` | Frozen `Reading` with `pressure_pa`, `temperature_c`; `altitude_m=None` |
+| `read(mode="altitude")` | `Reading` with `altitude_m`, `temperature_c`; `pressure_pa=None` |
+| `read_pressure()` | Fresh absolute pressure in Pa; divide by 100 for hPa |
+| `read_temperature()` | Fresh temperature in Celsius |
+| `read_altitude()` | Fresh altitude estimate in meters |
+| `sea_level_pressure_pa` | Get/set the altitude calculation's sea-level reference in Pa |
+| `close()` | Close this driver and its internally opened bus; safe to repeat |
+
+Every read method triggers a new conversion. Use `read()` to get pressure
+and temperature from the **same** conversion. Pressure and altitude share
+the same hardware registers, so acquiring both requires separate conversions.
+The sensor returns to standby after each conversion. Per-instance operations
+are serialized with a lock, but multiple instances/processes must not control
+the same sensor. The bus itself must be coordinated externally if shared
+with unrelated code.
+
+For local altitude correction, supply a current sea-level pressure reference:
+
+```python
+with MPL3115A2() as sensor:
+    sensor.sea_level_pressure_pa = 101000  # Example only; use your local value.
+    print(sensor.read_altitude())
+```
+
+The hardware reference defaults to 101326 Pa, has 2 Pa resolution, and
+accepts values from 2 to 131070 Pa. The setter rounds to the nearest 2 Pa
+(ties upward); read the property back to see the applied value. This is a
+reference for altitude estimation, not a correction to raw pressure.
+Altitude varies with weather and the atmosphere model; this is not GPS
+altitude. Temperature is sensor die temperature.
+
+### Errors and ownership
+
+- `DeviceNotFoundError` (an `OSError`) means WHO_AM_I did not match `0xC4`.
+- `TimeoutError` means the conversion did not finish or both ready flags
+  were not raised. Confirm power, wiring, bus and timeout settings.
+- Bus `OSError` exceptions propagate, preserving the original failure.
+- Short output transfers raise `OSError`; invalid settings raise `ValueError`.
+- Reading after `close()` raises `RuntimeError`.
+
+Allow the sensor to power up before creating the driver. Initialization
+checks identity, enters standby, disables FIFO and interrupt sources,
+selects normal output updates, and enables data-ready flags. It does not
+reset calibration/reference registers or rewrite user offsets. Each read
+waits for any previous one-shot to finish, selects the requested mode in
+standby, discards stale output, triggers OST, waits for OST to clear and
+both PDR/TDR flags, then reads all five bytes in one burst. Closing after
+a timeout leaves any in-flight conversion to complete and return to standby.
+
+## What changes from the supplied snippet
+
+`CTRL_REG1=0x39` selects barometer mode, 128x oversampling and continuous
+acquisition. A fixed 0.5 s sleep is shorter than the listed 512 ms sample
+time at that oversampling. This library uses fresh standby one-shot
+conversions instead, enabling `PT_DATA_CFG=0x07` and checking completion.
+
+Conversions discard the reserved low nibble:
+
+- Pressure: unsigned 20-bit output divided by 4 (Q18.2).
+- Altitude: signed two's-complement 20-bit output divided by 16 (Q16.4).
+- Temperature: signed two's-complement 12-bit output divided by 16 (Q8.4).
+
+## Verification and scope
+
+```sh
+python -m pip install ".[test]"
+python -m pytest -q
+```
+
+Tests use an SMBus sensor model and literal register vectors. They cover
+fractional and signed conversions, fresh reads, mode changes, standby
+sequencing, oversampling, timeouts and recovery, identity failures,
+transport errors, reference encoding and bus ownership.
+
+**Hardware has not been tested here.** On your Pi, first run the example
+and check pressure against a local reference and temperature for plausibility.
+This initial driver supports polling one-shot acquisition. FIFO streaming,
+GPIO interrupts, threshold events and offset calibration have no public API.
+
+## Datasheet source
+
+Implemented from [NXP MPL3115A2 datasheet, Rev. 8.1, 17 May 2024](https://www.nxp.com/docs/en/data-sheet/MPL3115A2.pdf),
+especially sections 14.2-14.4, 14.7, 14.8, 14.12, 14.13 and 14.22.
+The supplied `39f294ec336cc1babd868de1c14c9ac3.pdf` is instead a Diodes
+AP62300/AP62301/AP62300T buck-converter datasheet; it was not used for
+sensor register definitions.
